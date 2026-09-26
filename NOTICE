@@ -1,0 +1,19 @@
+antora-ls
+Copyright 2026 Moritz
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Its Antora content model and resource-ID resolution (component/version/module/
+family lookup, xref/include/image target handling, completion and diagnostics)
+are derived from the Antora support in the AsciiDoc plugin for IntelliJ,
+reimplemented in Rust as a standalone language server:
+
+  asciidoctor-intellij-plugin
+  https://github.com/asciidoctor/asciidoctor-intellij-plugin
+  Copyright (C) 2013-2020 Julien Viet, Erik Pragt, Alexander Schwartz
+  and the individual contributors.
+  Licensed under the Apache License, Version 2.0.
+
+Changes from the original: rewritten in Rust as an LSP server (tower-lsp);
+IntelliJ PSI/indexing replaced by a filesystem scan of antora.yml and module
+directories; editor integration moved to the Language Server Protocol.

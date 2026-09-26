@@ -1,0 +1,22 @@
+[package]
+name = "antora-ls"
+version = "0.1.0"
+edition = "2021"
+description = "Language server for Antora documentation sites (xref/include/image resolution, completion, diagnostics)"
+license = "Apache-2.0"
+
+[dependencies]
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+walkdir = "2"
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true

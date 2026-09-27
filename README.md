@@ -37,10 +37,12 @@ Both are offered as code actions on any file in the site.
 
 ### Live site preview
 
-*Antora: Open live site preview* builds the whole site with the project's own Antora and opens the current page in the browser. After that it behaves like a dev server with hot reload:
+*Antora: Open live site preview* builds the site with the project's own Antora and opens the current page in the browser. After that it behaves like a dev server with hot reload:
+
+- **Fast start**: the browser opens right away and shows the build's progress, which also appears in the editor's status bar, then switches to the page. Cancelling the progress in the editor stops the preview; open it again to restart it. Pages are converted when first viewed rather than all up front; every page's header is still read, so xref text and navigation are complete. A site of 11,000 pages is ready in about 4 seconds instead of 80.
 
 - **Built from HEAD**: local content sources are read from the working tree, whatever branches or tags the playbook names, so you see what you're editing. Sources whose start path doesn't exist in HEAD are skipped; remote sources are built as the playbook defines them.
-- **Live**: unsaved edits are sent as you type; only the changed page is re-rendered and its article is swapped into the open page without a reload. Changes to partials and examples re-render the pages that include them; nav changes rebuild the navigation. New files, deletions, and changes to `antora.yml` or the playbook's `supplemental_files` trigger a full rebuild (a replaced UI bundle zip is picked up when the language server, and with it the preview, restarts). Saved changes from other tools (git, other editors) are picked up by a file watcher.
+- **Live**: unsaved edits are sent as you type; only the changed page is re-rendered and its article is swapped into the open page without a reload. Changes to partials and examples re-render the pages that include them; nav changes rebuild the navigation. New files, deletions, and changes to `antora.yml` or the playbook's `supplemental_files` trigger a full rebuild, one at a time, while the previous build stays viewable with a *Rebuilding* badge (a replaced UI bundle zip is picked up when the language server, and with it the preview, restarts). Saved changes from other tools (git, other editors) are picked up by a file watcher. If a build fails, the error is shown in the browser and the editor; saving a file retries.
 - **Follows the cursor**: the browser scrolls to the block you're editing, and switches to another page when you start editing it.
 - **In memory**: the site is served from memory on `127.0.0.1` and nothing is written to the project. Updates are only accepted from the language server (they carry a per-session token).
 
@@ -74,7 +76,7 @@ cargo test
 
 ## Release
 
-Push a tag like `v0.1.0`. The `release` workflow builds `antora-ls-<arch>-<target>.tar.gz|zip` assets for macOS, Linux and Windows, which the Zed extension downloads. The extension downloads without authentication, so this only works once the repository is public.
+Push a tag like `v0.2.0`. The `release` workflow builds `antora-ls-<arch>-<target>.tar.gz|zip` assets for macOS, Linux and Windows, which the Zed extension downloads. The extension downloads without authentication, so this only works once the repository is public.
 
 ## Limitations
 
@@ -82,6 +84,7 @@ Push a tag like `v0.1.0`. The `release` workflow builds `antora-ls-<arch>-<targe
 - Moving a resource to another module, component or family doesn't rewrite references (renames and moves within the family directory do).
 - Undoing a rename in the editor reverts the text edits but not the file move; rename again to reverse it.
 - The live preview runs in a browser; editors like Zed have no API for extensions to embed one.
+- Because pages are rendered on demand, a search extension such as Lunr only indexes page titles in the preview, and Antora extensions that post-process converted pages don't run on them.
 
 ## License and attribution
 

@@ -25,6 +25,8 @@ struct State {
     descriptors: HashSet<Url>,
     /// Client can apply file renames inside a WorkspaceEdit.
     can_rename_files: bool,
+    /// Client shows progress that the server starts (`window/workDoneProgress/create`).
+    work_done_progress: bool,
     /// `preview.runtime` from initialization options: path to bun or node.
     preview_runtime: Option<String>,
 }
@@ -51,9 +53,13 @@ struct Backend {
     client: Client,
     state: Arc<RwLock<State>>,
     preview: std::sync::Mutex<Option<preview::Preview>>,
-    preview_starting: std::sync::atomic::AtomicBool,
+    /// Held while the preview starts. A lock rather than a flag, so it's released even when
+    /// the request is cancelled mid-start.
+    preview_start: tokio::sync::Mutex<()>,
     markdown: MarkdownSource,
     markdown_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Becomes true once the workspace has been indexed.
+    indexed: tokio::sync::watch::Sender<bool>,
 }
 
 fn snapshot_of(state: &State) -> (Arc<Catalog>, OpenTexts) {
@@ -109,6 +115,70 @@ async fn refresh_markdown(state: Arc<RwLock<State>>, source: MarkdownSource) {
 
 const MAX_COMPLETIONS: usize = 2000;
 
+/// Prefix of the progress tokens for preview builds; cancelling one stops the preview.
+const PREVIEW_PROGRESS: &str = "antora-preview-build-";
+
+/// Show the preview's builds as cancellable progress in the editor, and report failures.
+/// Takes the server's status updates, then how it ended.
+fn build_progress(client: Client, supported: bool) -> tokio::sync::mpsc::UnboundedSender<preview::Event> {
+    static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<preview::Event>();
+    tokio::spawn(async move {
+        let mut active: Option<NumberOrString> = None;
+        let progress = |token: NumberOrString, value: WorkDoneProgress| {
+            let client = client.clone();
+            async move {
+                let value = ProgressParamsValue::WorkDone(value);
+                client.send_notification::<notification::Progress>(ProgressParams { token, value }).await;
+            }
+        };
+        while let Some(event) = rx.recv().await {
+            let status = match &event {
+                preview::Event::Status(s) => Some(s),
+                _ => None,
+            };
+            let building = status.is_some_and(|s| s.state == "building");
+            let message = status.and_then(|s| s.phase.clone());
+            match (&active, building) {
+                (Some(token), true) => {
+                    let report = WorkDoneProgressReport { message, cancellable: Some(true), ..Default::default() };
+                    progress(token.clone(), WorkDoneProgress::Report(report)).await;
+                }
+                (None, true) if supported => {
+                    let n = BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let token = NumberOrString::String(format!("{PREVIEW_PROGRESS}{n}"));
+                    let create = WorkDoneProgressCreateParams { token: token.clone() };
+                    if client.send_request::<request::WorkDoneProgressCreate>(create).await.is_ok() {
+                        let title = "Building Antora preview".to_string();
+                        let begin = WorkDoneProgressBegin { title, message, cancellable: Some(true), ..Default::default() };
+                        progress(token.clone(), WorkDoneProgress::Begin(begin)).await;
+                        active = Some(token);
+                    }
+                }
+                (_, false) => {
+                    if let Some(token) = active.take() {
+                        progress(token, WorkDoneProgress::End(WorkDoneProgressEnd::default())).await;
+                    }
+                }
+                _ => {}
+            }
+            match event {
+                preview::Event::Status(s) if s.state == "failed" => {
+                    let error = s.error.unwrap_or_default();
+                    client.show_message(MessageType::ERROR, format!("Antora preview: the site build failed: {error}")).await;
+                }
+                preview::Event::Exited => {
+                    let msg = "Antora preview: the preview server stopped unexpectedly; see the antora-ls log";
+                    client.show_message(MessageType::WARNING, msg).await;
+                }
+                preview::Event::Stopped => client.log_message(MessageType::INFO, "antora-ls: preview stopped").await,
+                _ => {}
+            }
+        }
+    });
+    tx
+}
+
 impl Backend {
     async fn rescan(&self) {
         let roots = self.state.read().await.roots.clone();
@@ -141,6 +211,7 @@ impl Backend {
             )
             .await;
         self.state.write().await.catalog = Arc::new(catalog);
+        self.indexed.send_replace(true);
         self.publish_descriptors().await;
         self.publish_all().await;
     }
@@ -180,8 +251,15 @@ impl Backend {
         snapshot_of(&*self.state.read().await)
     }
 
+    /// Wait for the first index of the workspace, for commands run right after startup.
+    async fn wait_indexed(&self) {
+        let mut indexed = self.indexed.subscribe();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), indexed.wait_for(|done| *done)).await;
+    }
+
     /// Convert `file` to Markdown and open the result for the editor's Markdown preview.
     async fn open_markdown_preview(&self, file: PathBuf) -> std::result::Result<(), String> {
+        self.wait_indexed().await;
         let (catalog, open) = self.snapshot().await;
         let dest = markdown_path(&self.state.read().await.roots);
         let (src, out) = (file.clone(), dest.clone());
@@ -257,6 +335,16 @@ impl Backend {
         self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
     }
 
+    /// Handles `window/workDoneProgress/cancel`: cancelling a preview build stops the preview.
+    async fn cancel_progress(&self, p: WorkDoneProgressCancelParams) {
+        let NumberOrString::String(token) = p.token else { return };
+        if token.starts_with(PREVIEW_PROGRESS) {
+            if let Some(preview) = self.preview.lock().unwrap().take() {
+                preview.stop();
+            }
+        }
+    }
+
     /// Forward to the live preview, if one is running.
     fn to_preview(&self, msg: preview::Msg) {
         if let Some(p) = self.preview.lock().unwrap().as_ref() {
@@ -264,8 +352,10 @@ impl Backend {
         }
     }
 
-    /// Start the live site preview if needed and open `file`'s page in the browser.
+    /// Start the live site preview if needed and open `file`'s page in the browser. The
+    /// browser shows build progress until the site is ready.
     async fn open_site_preview(&self, file: PathBuf) -> std::result::Result<(), String> {
+        let starting = self.preview_start.lock().await;
         let running = {
             let mut guard = self.preview.lock().unwrap();
             if guard.as_mut().is_some_and(|p| !p.is_running()) {
@@ -276,18 +366,13 @@ impl Backend {
         let url = match running {
             Some(url) => url,
             None => {
-                use std::sync::atomic::Ordering::SeqCst;
-                if self.preview_starting.swap(true, SeqCst) {
-                    return Err("The preview is already starting".into());
-                }
-                let started = self.start_preview().await;
-                self.preview_starting.store(false, SeqCst);
-                let p = started?;
+                let p = self.start_preview().await?;
                 let url = p.open_url(&file);
                 *self.preview.lock().unwrap() = Some(p);
                 url
             }
         };
+        drop(starting);
         let uri = Url::parse(&url).map_err(|e| e.to_string())?;
         let params = ShowDocumentParams { uri, external: Some(true), take_focus: Some(true), selection: None };
         self.client.show_document(params).await.map_err(|e| e.to_string())?;
@@ -295,6 +380,7 @@ impl Backend {
     }
 
     async fn start_preview(&self) -> std::result::Result<preview::Preview, String> {
+        self.wait_indexed().await;
         let (catalog, open) = self.snapshot().await;
         let playbook = preview::pick_playbook(&catalog.playbooks)
             .ok_or("No Antora playbook (*playbook*.yml with content sources) found in the workspace")?;
@@ -305,11 +391,15 @@ impl Backend {
             .log_message(MessageType::INFO, format!("antora-ls: starting preview of {} with {}", playbook.display(), runtime.display()))
             .await;
         let client = self.client.clone();
-        let log = move |line: String| {
-            let client = client.clone();
-            tokio::spawn(async move { client.log_message(MessageType::LOG, line).await });
+        let progress = build_progress(client.clone(), self.state.read().await.work_done_progress);
+        let on_event = move |event| match event {
+            preview::Event::Log(line) => {
+                let client = client.clone();
+                tokio::spawn(async move { client.log_message(MessageType::LOG, line).await });
+            }
+            event => _ = progress.send(event),
         };
-        let p = preview::Preview::start(&runtime, &playbook, log).await?;
+        let p = preview::Preview::start(&runtime, &playbook, on_event).await?;
         // Show unsaved edits right away.
         for (path, text) in open {
             p.send(preview::Msg::Update(path, Some(text)));
@@ -444,6 +534,12 @@ impl LanguageServer for Backend {
             .and_then(|w| w.workspace_edit)
             .and_then(|e| e.resource_operations)
             .is_some_and(|ops| ops.contains(&ResourceOperationKind::Rename));
+        let work_done_progress = params
+            .capabilities
+            .window
+            .as_ref()
+            .and_then(|w| w.work_done_progress)
+            .unwrap_or(false);
         let preview_runtime = params
             .initialization_options
             .as_ref()
@@ -454,6 +550,7 @@ impl LanguageServer for Backend {
             let mut state = self.state.write().await;
             state.roots = roots;
             state.can_rename_files = can_rename_files;
+            state.work_done_progress = work_done_progress;
             state.preview_runtime = preview_runtime;
         }
 
@@ -894,14 +991,17 @@ async fn main() {
         println!("antora-ls {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    let (service, socket) = LspService::new(|client| Backend {
+    let (service, socket) = LspService::build(|client| Backend {
         client,
         state: Arc::new(RwLock::new(State::default())),
         preview: Default::default(),
-        preview_starting: Default::default(),
+        preview_start: Default::default(),
         markdown: Default::default(),
         markdown_generation: Default::default(),
-    });
+        indexed: tokio::sync::watch::Sender::new(false),
+    })
+    .custom_method("window/workDoneProgress/cancel", Backend::cancel_progress)
+    .finish();
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket).serve(service).await;
 }
 

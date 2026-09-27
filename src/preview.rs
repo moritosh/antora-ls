@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -12,6 +14,7 @@ use tokio::sync::mpsc;
 
 const SCRIPT: &str = include_str!("../preview/antora-preview.js");
 const HANDSHAKE: &str = "ANTORA_PREVIEW ";
+const STATUS: &str = "ANTORA_PREVIEW_STATUS ";
 /// Keystrokes arriving within this window are sent as one update.
 const COALESCE: Duration = Duration::from_millis(40);
 
@@ -21,15 +24,41 @@ pub enum Msg {
     Cursor(PathBuf, u32),
 }
 
+/// Output of the preview server.
+pub enum Event {
+    Log(String),
+    Status(Status),
+    /// The server process ended by itself.
+    Exited,
+    /// The server was stopped with [`Preview::stop`].
+    Stopped,
+}
+
+/// Build progress reported by the server.
+#[derive(serde::Deserialize)]
+pub struct Status {
+    /// `building`, `ready` or `failed`.
+    pub state: String,
+    pub phase: Option<String>,
+    pub error: Option<String>,
+}
+
 pub struct Preview {
     pub base: String,
     tx: mpsc::UnboundedSender<Msg>,
     child: Child,
+    stopped: Arc<AtomicBool>,
 }
 
 impl Preview {
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Kill the server, e.g. to cancel a build.
+    pub fn stop(mut self) {
+        self.stopped.store(true, SeqCst);
+        let _ = self.child.start_kill();
     }
 
     pub fn send(&self, msg: Msg) {
@@ -41,11 +70,12 @@ impl Preview {
         format!("{}/__preview/open?path={}", self.base, percent_encode(&file.to_string_lossy()))
     }
 
-    /// Start the server for `playbook`; `log` receives the server's output lines.
+    /// Start the server for `playbook`. It answers right away and builds the site in the
+    /// background; `on_event` receives its log lines and build progress.
     pub async fn start(
         runtime: &Path,
         playbook: &Path,
-        log: impl Fn(String) + Send + Sync + 'static,
+        on_event: impl Fn(Event) + Send + Sync + 'static,
     ) -> Result<Preview, String> {
         let dir = std::env::temp_dir().join(format!("antora-ls-{}", env!("CARGO_PKG_VERSION")));
         let script = dir.join("antora-preview.js");
@@ -64,9 +94,13 @@ impl Preview {
             .spawn()
             .map_err(|e| format!("can't run {}: {e}", runtime.display()))?;
 
-        let log = std::sync::Arc::new(log);
+        let on_event = Arc::new(on_event);
+        let log = {
+            let on_event = on_event.clone();
+            Arc::new(move |line: String| on_event(Event::Log(line)))
+        };
         let stderr = child.stderr.take().expect("piped");
-        let recent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         {
             let (log, recent) = (log.clone(), recent.clone());
             tokio::spawn(async move {
@@ -105,9 +139,21 @@ impl Preview {
         let (base, token) = rest.split_once(' ').ok_or_else(|| failure("sent a malformed handshake"))?;
         let (base, token) = (base.to_string(), token.to_string());
 
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_ = stopped.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = stdout.next_line().await {
+                match line.strip_prefix(STATUS).map(serde_json::from_str::<Status>) {
+                    Some(Ok(status)) => on_event(Event::Status(status)),
+                    _ => on_event(Event::Log(line)),
+                }
+            }
+            on_event(if stopped_.load(SeqCst) { Event::Stopped } else { Event::Exited });
+        });
+
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(forward(base.clone(), token, rx, log.clone()));
-        Ok(Preview { base, tx, child })
+        Ok(Preview { base, tx, child, stopped })
     }
 }
 
@@ -116,7 +162,7 @@ async fn forward(
     base: String,
     token: String,
     mut rx: mpsc::UnboundedReceiver<Msg>,
-    log: std::sync::Arc<impl Fn(String) + Send + Sync + 'static>,
+    log: Arc<impl Fn(String) + Send + Sync + 'static>,
 ) {
     while let Some(first) = rx.recv().await {
         let mut updates: HashMap<PathBuf, Option<String>> = HashMap::new();

@@ -2,14 +2,16 @@
 
 // Live preview for Antora sites.
 //
-// Builds the site once from HEAD (the working tree of local content sources) using the
-// project's own Antora, keeps the result in memory and serves it over HTTP. When a file
-// changes — saved to disk, or unsaved text posted by antora-ls — only the affected page is
-// re-rendered and pushed to open browsers, which swap in the new article without a reload.
+// Builds the site from HEAD (the working tree of local content sources) using the project's
+// own Antora, keeps the result in memory and serves it over HTTP. Pages are converted when
+// first requested, so large sites are ready quickly. When a file changes — saved to disk, or
+// unsaved text posted by antora-ls — only the affected page is re-rendered and pushed to open
+// browsers, which swap in the new article without a reload.
 //
 // Usage: bun antora-preview.js <playbook> [--port N]
-// Prints `ANTORA_PREVIEW <url> <token>` on stdout once the server is ready; logs go to stderr.
-// Only Node built-ins are used, so it runs under Bun or Node.
+// Prints `ANTORA_PREVIEW <url> <token>` on stdout as soon as the server listens (browsers get a
+// progress page until the first build is done), then `ANTORA_PREVIEW_STATUS <json>` lines as
+// builds progress; logs go to stderr. Only Node built-ins are used, so it runs under Bun or Node.
 
 const fs = require('node:fs')
 const http = require('node:http')
@@ -18,7 +20,7 @@ const crypto = require('node:crypto')
 const { createRequire } = require('node:module')
 
 // Shared with the copy of this module that Antora loads as an extension.
-const S = (globalThis.__antoraPreview ??= { clients: new Set(), overlays: new Map() })
+const S = (globalThis.__antoraPreview ??= { clients: new Set(), overlays: new Map(), status: {} })
 
 // --- Antora extension -------------------------------------------------------------------
 
@@ -27,7 +29,34 @@ function register () {
   const out = S.pending
   if (!out) return // loaded outside the preview server
 
+  // Defer converting and composing pages to the first request for each: reading every page's
+  // header (for xref text and navigation) is a fraction of the work of rendering it.
+  this.once('contextStarted', () => {
+    const { convertDocument, createPageComposer } = this.getFunctions()
+    out.convertDocument = convertDocument
+    this.replaceFunctions({
+      convertDocument (file) {
+        file.contents = Buffer.alloc(0)
+        file.mediaType = 'text/html'
+        return file
+      },
+      createPageComposer (playbook, contentCatalog, uiCatalog, env = playbook.env) {
+        // Keep env as it is now: extensions may change it before pages are composed on request.
+        env = Object.assign({}, env)
+        const composer = createPageComposer(Object.assign({}, playbook, { env }), contentCatalog, uiCatalog, env)
+        out.composePage = composer.composePage
+        return Object.assign({}, composer, { composePage: (page) => page })
+      },
+    })
+  })
+  const phase = (name) => () => setStatus({ phase: name })
+  this.once('playbookBuilt', phase('Reading content sources'))
+  this.once('contentAggregated', phase('Classifying content'))
+  this.once('documentsConverted', phase('Building navigation'))
+  this.once('navigationBuilt', phase('Preparing pages'))
+
   this.once('contentClassified', ({ contentCatalog }) => {
+    setStatus({ phase: 'Reading page headers' })
     for (const component of contentCatalog.getComponents()) {
       for (const cv of component.versions) {
         cv.asciidoc = Object.assign({}, cv.asciidoc, {
@@ -51,14 +80,15 @@ function register () {
     out.navigationCatalog = navigationCatalog
   })
 
-  this.once('beforePublish', ({ playbook, contentCatalog, uiCatalog, siteCatalog, siteAsciiDocConfig }) => {
-    Object.assign(out, { playbook, contentCatalog, siteAsciiDocConfig, fxns: this.getFunctions() })
-    out.composePage = out.fxns.createPageComposer(playbook, contentCatalog, uiCatalog, playbook.env).composePage
+  this.once('beforePublish', ({ contentCatalog, uiCatalog, siteCatalog, siteAsciiDocConfig }) => {
+    Object.assign(out, { contentCatalog, siteAsciiDocConfig, fxns: this.getFunctions() })
     out.routes = new Map()
     for (const catalog of [contentCatalog, uiCatalog, siteCatalog]) {
       for (const file of catalog.getFiles()) if (file.out) out.routes.set(file.out.path, file)
     }
-    out.dirty = new Set()
+    out.dirty = new Set(contentCatalog.getPages(isPage))
+    // Antora drops page sources after converting; pages included elsewhere still need theirs.
+    for (const page of out.dirty) if ('page-partial' in page.asciidoc.attributes) page.src.contents = out.sources.get(page)
     this.stop() // everything is served from memory; skip writing the site to disk
   })
 }
@@ -129,6 +159,9 @@ function useHead (playbook) {
 
 async function build () {
   const req = S.req
+  const started = Date.now()
+  S.changed = new Set()
+  setStatus({ state: 'building', phase: 'Loading playbook', started, error: undefined })
   const playbook = req('@antora/playbook-builder')(['--playbook', S.playbookFile], process.env)
   // stdout carries the handshake line; Antora's log goes to stderr, readable for the editor's log.
   playbook.runtime.log = Object.assign({}, playbook.runtime.log, { format: 'pretty', destination: { file: 'stderr' } })
@@ -136,12 +169,18 @@ async function build () {
     req('@antora/logger').configureLogger(playbook.runtime.log, path.dirname(S.playbookFile))
   } catch {}
   useHead(playbook)
+  S.playbook = playbook
+  S.localDirs = playbook.content.sources.filter((s) => isLocal(s.url)).flatMap((s) => {
+    const dir = path.resolve(playbook.dir || '.', s.url)
+    return [].concat(s.startPaths ?? s.startPath ?? '').map((p) => path.join(dir, p.split(/[*{]/)[0]))
+  })
+  const supplemental = playbook.ui?.supplementalFiles
+  S.uiDir = typeof supplemental === 'string' ? path.resolve(playbook.dir || '.', supplemental) : undefined
   playbook.antora ??= {}
   playbook.antora.extensions = [...(playbook.antora.extensions || []), { require: __filename }]
   playbook.runtime.quiet = true
 
   const out = (S.pending = {})
-  const started = Date.now()
   try {
     await req('@antora/site-generator')(playbook)
   } finally {
@@ -149,26 +188,48 @@ async function build () {
   }
   if (!out.routes) throw new Error('site generation stopped before pages were composed')
   S.site = out
-  S.localDirs = playbook.content.sources.filter((s) => isLocal(s.url)).flatMap((s) => {
-    const dir = path.resolve(playbook.dir || '.', s.url)
-    return [].concat(s.startPaths ?? s.startPath ?? '').map((p) => path.join(dir, p.split(/[*{]/)[0]))
-  })
+  // Edits that arrived after the build read its files: apply them to the new site.
+  const changed = S.changed
+  S.changed = undefined
+  for (const abspath of changed) update(abspath, S.overlays.get(abspath) ?? null)
   log(`built ${[...out.routes.keys()].filter((p) => p.endsWith('.html')).length} pages in ${Date.now() - started} ms`)
+}
+
+/** Build, one at a time: changes during a build queue one more. Keeps serving the old site. */
+let building = false
+let rebuildQueued = false
+async function runBuild () {
+  if (building) return (rebuildQueued = true)
+  building = true
+  rebuildQueued = false
+  try {
+    await build()
+    setStatus({ state: 'ready', phase: undefined })
+    broadcast('reload', {})
+  } catch (err) {
+    S.changed = undefined
+    log('build failed: ' + (err.stack || err))
+    setStatus({ state: 'failed', phase: undefined, error: String(err.message || err) })
+  } finally {
+    building = false
+    watch()
+    if (rebuildQueued) scheduleRebuild()
+  }
 }
 
 let rebuildTimer
 function scheduleRebuild () {
   clearTimeout(rebuildTimer)
-  rebuildTimer = setTimeout(async () => {
-    try {
-      await build()
-      broadcast('reload', {})
-      watch()
-    } catch (err) {
-      log('rebuild failed: ' + (err.stack || err))
-    }
-  }, 150)
+  rebuildTimer = setTimeout(runBuild, 300)
 }
+
+/** Build progress, for the browser and (on stdout) for antora-ls. */
+function setStatus (patch) {
+  Object.assign(S.status, patch)
+  broadcast('status', S.status)
+  process.stdout.write(`${STATUS} ${JSON.stringify(S.status)}\n`)
+}
+const STATUS = 'ANTORA_PREVIEW_STATUS'
 
 // --- Incremental updates ------------------------------------------------------------------
 
@@ -178,7 +239,7 @@ function renderPage (page) {
   page.mediaType = 'text/asciidoc'
   delete page.asciidoc
   const cv = site.contentCatalog.getComponentVersion(page.src.component, page.src.version)
-  site.fxns.convertDocument(page, site.contentCatalog, cv?.asciidoc || site.siteAsciiDocConfig)
+  site.convertDocument(page, site.contentCatalog, cv?.asciidoc || site.siteAsciiDocConfig)
   site.composePage(page, site.contentCatalog, site.navigationCatalog)
   site.dirty.delete(page)
 }
@@ -190,14 +251,14 @@ function update (abspath, text) {
   abspath = realpath(abspath)
   if (text == null) S.overlays.delete(abspath)
   else S.overlays.set(abspath, text)
+  S.changed?.add(abspath)
 
   const site = S.site
-  const file = site?.byPath.get(abspath)
-  if (!file) {
-    // New files, antora.yml, UI changes, ...: anything outside the catalog needs a full build.
-    if (S.localDirs?.some((d) => abspath.startsWith(d)) || path.basename(abspath) === 'antora.yml') scheduleRebuild()
-    return
-  }
+  if (!site) return text == null && scheduleRebuild() // the first build failed: retry on save
+  // Files outside the catalog (new ones, antora.yml, ...) are left to the watcher, which
+  // rebuilds when they are created or saved.
+  const file = site.byPath.get(abspath)
+  if (!file) return
   let contents
   try {
     contents = text != null ? Buffer.from(text) : fs.readFileSync(abspath)
@@ -250,23 +311,28 @@ function cursor (abspath, line) {
 
 // --- File watching --------------------------------------------------------------------------
 
-let watchers = []
+/** Whether a change to `abspath` (reported by the watcher, not an edit) needs a full build. */
+function needsRebuild (abspath, event) {
+  if (!S.site || S.site.byPath.has(abspath)) return true // retrying a failed build; deleted
+  if (path.basename(abspath) === 'antora.yml' || (S.uiDir && abspath.startsWith(S.uiDir + path.sep))) return true
+  return event === 'rename' && abspath.split(path.sep).includes('modules') // new content file
+}
+
 function watch () {
-  watchers.forEach((w) => w.close())
-  watchers = []
-  const dirs = new Set(S.localDirs)
-  const supplemental = S.site.playbook.ui?.supplementalFiles
-  if (typeof supplemental === 'string') dirs.add(path.resolve(S.site.playbook.dir || '.', supplemental))
-  for (const dir of dirs) {
+  if (S.watching || !S.localDirs) return
+  S.watching = true
+  for (const dir of new Set([...S.localDirs, ...(S.uiDir ? [S.uiDir] : [])])) {
     try {
-      watchers.push(
-        fs.watch(dir, { recursive: true }, (event, name) => {
-          if (!name || name.split(path.sep).some((s) => s.startsWith('.'))) return
-          const abspath = realpath(path.join(dir, name))
-          if (event === 'rename' || !S.site.byPath.has(abspath)) return scheduleRebuild()
+      fs.watch(dir, { recursive: true }, (event, name) => {
+        if (!name || name.split(path.sep).some((s) => s.startsWith('.'))) return
+        const abspath = realpath(path.join(dir, name))
+        // Check the file itself: macOS reports most saves as renames.
+        if (S.site?.byPath.has(abspath) && fs.existsSync(abspath)) {
           if (!S.overlays.has(abspath)) update(abspath, null)
-        })
-      )
+        } else if (needsRebuild(abspath, event)) {
+          scheduleRebuild()
+        }
+      })
     } catch (err) {
       log(`can't watch ${dir}: ${err.message}`)
     }
@@ -299,6 +365,27 @@ const CLIENT = `(() => {
     document.querySelectorAll('article.doc pre.highlight code').forEach((el) => window.hljs?.highlightElement?.(el))
   })
   es.addEventListener('reload', () => location.reload())
+  let badge
+  const show = (text, failed) => {
+    if (!text) return badge?.remove()
+    if (!badge?.isConnected) {
+      badge = document.body.appendChild(document.createElement('div'))
+      badge.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:9999;max-width:40em;padding:6px 10px;' +
+        'border-radius:6px;font:13px system-ui,sans-serif;color:#fff;box-shadow:0 1px 4px #0004;cursor:pointer'
+      badge.title = 'Click to hide'
+      badge.onclick = () => badge.remove()
+    }
+    badge.style.background = failed ? '#b00020' : '#333'
+    badge.textContent = text
+  }
+  es.addEventListener('status', (e) => {
+    const { state, phase, error } = JSON.parse(e.data)
+    show(state === 'ready' ? '' : state === 'failed' ? 'Rebuild failed: ' + error : 'Rebuilding site: ' + (phase || '') + '…', state === 'failed')
+  })
+  // Checked after a moment, since reloading the page also interrupts the stream.
+  es.addEventListener('error', () => setTimeout(() => {
+    if (es.readyState !== EventSource.OPEN) show('The preview server stopped. Open the preview again from the editor.', true)
+  }, 1000))
   es.addEventListener('cursor', (e) => {
     const { page: target, line } = JSON.parse(e.data)
     if (target !== page) return (location.href = '/' + target + '#preview-line-' + line)
@@ -318,10 +405,67 @@ const CLIENT = `(() => {
   if (m) addEventListener('load', () => scrollToLine(+m[1]))
 })()`
 
-function handle (req, res) {
+/** Shown until the first build is done; reloads into the requested page then. */
+const LOADING = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Building preview…</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; font: 15px system-ui, sans-serif;
+    color: #333; background: #fafafa }
+  @media (prefers-color-scheme: dark) { body { color: #ddd; background: #1e1e1e } }
+  main { text-align: center; padding: 16px }
+  .spin { width: 28px; height: 28px; margin: 0 auto 16px; border: 3px solid #8884; border-top-color: currentColor;
+    border-radius: 50%; animation: spin 1s linear infinite }
+  @keyframes spin { to { transform: rotate(360deg) } }
+  #time { margin-top: 4px; font-size: 13px; opacity: .6 }
+  pre { max-width: 80ch; white-space: pre-wrap; text-align: left; color: #d33 }
+</style></head>
+<body><main>
+  <div class="spin" id="spin"></div>
+  <div id="msg">Building the site…</div>
+  <div id="time"></div>
+  <pre id="err" hidden></pre>
+</main>
+<script>
+  const es = new EventSource('/__preview/events')
+  let started = Date.now()
+  es.addEventListener('status', (e) => {
+    const s = JSON.parse(e.data)
+    if (s.state === 'ready') return location.reload()
+    if (s.started) started = s.started
+    const failed = s.state === 'failed'
+    spin.hidden = time.hidden = failed
+    err.hidden = !failed
+    err.textContent = s.error || ''
+    msg.textContent = failed ? 'The site build failed. Save a file to retry.' : 'Building the site: ' + (s.phase || '') + '…'
+  })
+  es.addEventListener('reload', () => location.reload())
+  es.addEventListener('error', () => setTimeout(() => {
+    if (es.readyState === EventSource.OPEN) return
+    spin.hidden = time.hidden = true
+    msg.textContent = 'The preview server stopped. Open the preview again from the editor.'
+  }, 1000))
+  setInterval(() => (time.textContent = Math.round((Date.now() - started) / 1000) + ' s'), 1000)
+</script>
+</body></html>`
+
+/** Serve a request; one that fails gets a 500 and doesn't take the server down. */
+async function handle (req, res) {
+  try {
+    await serve(req, res)
+  } catch (err) {
+    log(`${req.method} ${req.url} failed: ${err.stack || err}`)
+    if (!res.headersSent) reply(res, 500, 'text/plain', String(err))
+    else res.destroy()
+  }
+}
+
+async function serve (req, res) {
   const url = new URL(req.url, 'http://localhost')
-  if (url.pathname.startsWith('/__preview/')) return api(req, res, url)
+  if (url.pathname.startsWith('/__preview/') && url.pathname !== '/__preview/open') return api(req, res, url)
   if (req.method !== 'GET' && req.method !== 'HEAD') return reply(res, 405, 'text/plain', 'method not allowed')
+  if (!S.site) return reply(res, 200, TYPES['.html'], LOADING)
+  if (url.pathname === '/__preview/open') return open(res, url)
 
   let key = decodeURIComponent(url.pathname).replace(/^\/+/, '')
   if (key === '' || key.endsWith('/')) key += 'index.html'
@@ -333,8 +477,19 @@ function handle (req, res) {
   }
   if (site.dirty.has(file)) renderPage(file)
   const type = TYPES[path.extname(file.out.path).toLowerCase()] || 'application/octet-stream'
-  const body = type.startsWith('text/html') ? inject(file.contents.toString()) : file.contents
-  reply(res, 200, type, body)
+  const contents = await contentsOf(file)
+  reply(res, 200, type, type.startsWith('text/html') ? inject(contents.toString()) : contents)
+}
+
+/** A file's contents as a Buffer. Some, like assets that extensions add to the UI, are a
+ * stream until published; read it once and keep the result. */
+async function contentsOf (file) {
+  const contents = file.contents
+  if (contents == null) return Buffer.alloc(0)
+  if (Buffer.isBuffer(contents) || typeof contents === 'string') return contents
+  const chunks = []
+  for await (const chunk of contents) chunks.push(Buffer.from(chunk))
+  return (file.contents = Buffer.concat(chunks))
 }
 
 const inject = (html) => html.replace(/<\/body>/i, '<script src="/__preview/client.js"></script></body>')
@@ -352,15 +507,9 @@ function api (req, res, url) {
     res.write(': connected\n\n')
     const client = { res, page: url.searchParams.get('page') || 'index.html' }
     S.clients.add(client)
+    send(client, 'status', S.status)
     req.on('close', () => S.clients.delete(client))
     return
-  }
-  if (route === 'open') {
-    // Redirect to the page for a source file, or the site start page.
-    const file = S.site.byPath.get(realpath(url.searchParams.get('path') || '.'))
-    const target = file && isPage(file) ? '/' + file.out.path : '/'
-    res.writeHead(302, { location: target })
-    return res.end()
   }
   if (req.method !== 'POST') return reply(res, 404, 'text/plain', 'not found')
   if (req.headers['x-preview-token'] !== S.token) return reply(res, 403, 'text/plain', 'forbidden')
@@ -378,6 +527,13 @@ function api (req, res, url) {
       reply(res, 500, 'text/plain', String(err))
     }
   })
+}
+
+/** Redirect to the page for a source file, or the site start page. */
+function open (res, url) {
+  const file = S.site.byPath.get(realpath(url.searchParams.get('path') || '.'))
+  res.writeHead(302, { location: file && isPage(file) ? '/' + file.out.path : '/' })
+  res.end()
 }
 
 function send (client, event, data) {
@@ -405,12 +561,14 @@ async function main () {
   S.playbookFile = path.resolve(args[0])
   S.req = antoraRequire(S.playbookFile)
   S.token = crypto.randomBytes(16).toString('hex')
-  await build()
-  watch()
+  process.stdout.on('error', () => {}) // antora-ls stopped reading; it closes stdin when it exits
+  // A bug in one request or update shouldn't end the preview.
+  process.on('uncaughtException', (err) => log('internal error: ' + (err.stack || err)))
+  process.on('unhandledRejection', (err) => log('internal error: ' + (err?.stack || err)))
   const server = http.createServer(handle)
-  server.listen(port, '127.0.0.1', () => {
-    process.stdout.write(`ANTORA_PREVIEW http://127.0.0.1:${server.address().port} ${S.token}\n`)
-  })
+  await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve))
+  process.stdout.write(`ANTORA_PREVIEW http://127.0.0.1:${server.address().port} ${S.token}\n`)
+  runBuild()
   // Keep SSE connections alive through proxies and sleeping laptops.
   setInterval(() => S.clients.forEach((c) => c.res.write(': ping\n\n')), 15000).unref()
   // Exit with the editor: antora-ls holds our stdin open.

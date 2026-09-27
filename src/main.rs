@@ -1,5 +1,7 @@
 mod catalog;
+mod markdown;
 mod nav;
+mod preview;
 mod refs;
 mod scan;
 
@@ -23,7 +25,16 @@ struct State {
     descriptors: HashSet<Url>,
     /// Client can apply file renames inside a WorkspaceEdit.
     can_rename_files: bool,
+    /// `preview.runtime` from initialization options: path to bun or node.
+    preview_runtime: Option<String>,
 }
+
+const CMD_SITE_PREVIEW: &str = "antora.preview.site";
+const CMD_MARKDOWN_PREVIEW: &str = "antora.preview.markdown";
+
+/// The page shown in the Markdown preview. There is one preview; it follows the page being
+/// edited, so it only has to be opened once.
+type MarkdownSource = Arc<std::sync::Mutex<Option<PathBuf>>>;
 
 /// Open documents' text keyed by canonical path, for work that reads many files.
 type OpenTexts = HashMap<PathBuf, String>;
@@ -39,6 +50,61 @@ fn invalid(msg: impl Into<String>) -> tower_lsp::jsonrpc::Error {
 struct Backend {
     client: Client,
     state: Arc<RwLock<State>>,
+    preview: std::sync::Mutex<Option<preview::Preview>>,
+    preview_starting: std::sync::atomic::AtomicBool,
+    markdown: MarkdownSource,
+    markdown_generation: Arc<std::sync::atomic::AtomicU64>,
+}
+
+fn snapshot_of(state: &State) -> (Arc<Catalog>, OpenTexts) {
+    let open = state
+        .docs
+        .iter()
+        .filter_map(|(uri, text)| Some((canonical(&uri.to_file_path().ok()?), text.clone())))
+        .collect();
+    (state.catalog.clone(), open)
+}
+
+/// The Markdown rendering of the followed page: a read-only file in the temp dir, one per
+/// workspace and stable across server restarts so an open preview keeps updating.
+fn markdown_path(roots: &[PathBuf]) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    roots.hash(&mut h);
+    let dir = std::env::temp_dir().join(format!("antora-ls-preview-{:016x}", h.finish()));
+    let path = dir.join("Antora Preview.md");
+    // Canonical, so image paths computed relative to it match what the editor sees.
+    catalog::canonical_lenient(&path)
+}
+
+fn write_markdown(catalog: &Catalog, open: &OpenTexts, source: &Path, dest: &Path) -> std::io::Result<()> {
+    let text = text_of(open, source).unwrap_or_default();
+    let md = markdown::render(catalog, source, &text, &|p| text_of(open, p), dest.parent());
+    if std::fs::read_to_string(dest).is_ok_and(|old| old == md) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dest.parent().unwrap_or(Path::new(".")))?;
+    // Write a sibling and rename over the old file, so the editor never reads a partial file;
+    // read-only permissions keep accidental edits from blocking reloads.
+    let tmp = dest.with_extension("md.tmp");
+    std::fs::write(&tmp, md)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444))?;
+    }
+    std::fs::rename(&tmp, dest)
+}
+
+/// Regenerate the Markdown preview from the followed page (and anything it includes).
+async fn refresh_markdown(state: Arc<RwLock<State>>, source: MarkdownSource) {
+    let Some(source) = source.lock().unwrap().clone() else { return };
+    let (catalog, open, dest) = {
+        let state = state.read().await;
+        let (catalog, open) = snapshot_of(&state);
+        (catalog, open, markdown_path(&state.roots))
+    };
+    let _ = tokio::task::spawn_blocking(move || write_markdown(&catalog, &open, &source, &dest)).await;
 }
 
 const MAX_COMPLETIONS: usize = 2000;
@@ -111,13 +177,59 @@ impl Backend {
     }
 
     async fn snapshot(&self) -> (Arc<Catalog>, OpenTexts) {
-        let state = self.state.read().await;
-        let open = state
-            .docs
-            .iter()
-            .filter_map(|(uri, text)| Some((canonical(&uri.to_file_path().ok()?), text.clone())))
-            .collect();
-        (state.catalog.clone(), open)
+        snapshot_of(&*self.state.read().await)
+    }
+
+    /// Convert `file` to Markdown and open the result for the editor's Markdown preview.
+    async fn open_markdown_preview(&self, file: PathBuf) -> std::result::Result<(), String> {
+        let (catalog, open) = self.snapshot().await;
+        let dest = markdown_path(&self.state.read().await.roots);
+        let (src, out) = (file.clone(), dest.clone());
+        tokio::task::spawn_blocking(move || write_markdown(&catalog, &open, &src, &out))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("can't write {}: {e}", dest.display()))?;
+        let first = self.markdown.lock().unwrap().replace(file).is_none();
+        let uri = Url::from_file_path(&dest).map_err(|_| "bad path".to_string())?;
+        let params = ShowDocumentParams { uri, external: Some(false), take_focus: Some(true), selection: None };
+        self.client.show_document(params).await.map_err(|e| e.to_string())?;
+        if first {
+            self.client
+                .show_message(
+                    MessageType::INFO,
+                    "Antora: run \"markdown: open preview to the side\" (cmd-k v) in the opened tab. \
+                     The preview then follows whichever page you edit.",
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Point the Markdown preview at `path` when the user works in another page.
+    async fn follow_markdown(&self, path: &Path) {
+        let current = self.markdown.lock().unwrap().clone();
+        let Some(current) = current else { return };
+        if current == path || !catalog::is_adoc(path) || self.state.read().await.catalog.locate(path).is_none() {
+            return;
+        }
+        *self.markdown.lock().unwrap() = Some(path.to_path_buf());
+        self.schedule_markdown_refresh();
+    }
+
+    /// Regenerate the Markdown preview shortly after the last keystroke.
+    fn schedule_markdown_refresh(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.markdown.lock().unwrap().is_none() {
+            return;
+        }
+        let generation = self.markdown_generation.fetch_add(1, SeqCst) + 1;
+        let (counter, state, previews) = (self.markdown_generation.clone(), self.state.clone(), self.markdown.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            if counter.load(SeqCst) == generation {
+                refresh_markdown(state, previews).await;
+            }
+        });
     }
 
     /// The resource a request is about: the reference under the cursor, else the current file.
@@ -143,6 +255,67 @@ impl Backend {
             diagnostics(&state.catalog, &path, text)
         };
         self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+    }
+
+    /// Forward to the live preview, if one is running.
+    fn to_preview(&self, msg: preview::Msg) {
+        if let Some(p) = self.preview.lock().unwrap().as_ref() {
+            p.send(msg);
+        }
+    }
+
+    /// Start the live site preview if needed and open `file`'s page in the browser.
+    async fn open_site_preview(&self, file: PathBuf) -> std::result::Result<(), String> {
+        let running = {
+            let mut guard = self.preview.lock().unwrap();
+            if guard.as_mut().is_some_and(|p| !p.is_running()) {
+                *guard = None; // exited or crashed: start a new one
+            }
+            guard.as_ref().map(|p| p.open_url(&file))
+        };
+        let url = match running {
+            Some(url) => url,
+            None => {
+                use std::sync::atomic::Ordering::SeqCst;
+                if self.preview_starting.swap(true, SeqCst) {
+                    return Err("The preview is already starting".into());
+                }
+                let started = self.start_preview().await;
+                self.preview_starting.store(false, SeqCst);
+                let p = started?;
+                let url = p.open_url(&file);
+                *self.preview.lock().unwrap() = Some(p);
+                url
+            }
+        };
+        let uri = Url::parse(&url).map_err(|e| e.to_string())?;
+        let params = ShowDocumentParams { uri, external: Some(true), take_focus: Some(true), selection: None };
+        self.client.show_document(params).await.map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn start_preview(&self) -> std::result::Result<preview::Preview, String> {
+        let (catalog, open) = self.snapshot().await;
+        let playbook = preview::pick_playbook(&catalog.playbooks)
+            .ok_or("No Antora playbook (*playbook*.yml with content sources) found in the workspace")?;
+        let runtime = preview::find_runtime(self.state.read().await.preview_runtime.as_deref()).ok_or(
+            "Neither bun nor node was found. Set lsp.antora-ls.initialization_options.preview.runtime in Zed settings",
+        )?;
+        self.client
+            .log_message(MessageType::INFO, format!("antora-ls: starting preview of {} with {}", playbook.display(), runtime.display()))
+            .await;
+        let client = self.client.clone();
+        let log = move |line: String| {
+            let client = client.clone();
+            tokio::spawn(async move { client.log_message(MessageType::LOG, line).await });
+        };
+        let p = preview::Preview::start(&runtime, &playbook, log).await?;
+        // Show unsaved edits right away.
+        for (path, text) in open {
+            p.send(preview::Msg::Update(path, Some(text)));
+        }
+        self.client.log_message(MessageType::INFO, format!("antora-ls: preview running at {}", p.base)).await;
+        Ok(p)
     }
 
     /// Build a WorkspaceEdit from planned edits, plus optional file renames.
@@ -271,10 +444,17 @@ impl LanguageServer for Backend {
             .and_then(|w| w.workspace_edit)
             .and_then(|e| e.resource_operations)
             .is_some_and(|ops| ops.contains(&ResourceOperationKind::Rename));
+        let preview_runtime = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.pointer("/preview/runtime"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         {
             let mut state = self.state.write().await;
             state.roots = roots;
             state.can_rename_files = can_rename_files;
+            state.preview_runtime = preview_runtime;
         }
 
         Ok(InitializeResult {
@@ -300,6 +480,13 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
+                // Editors ask for highlights whenever the cursor moves; the preview follows along.
+                document_highlight_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![CMD_SITE_PREVIEW.into(), CMD_MARKDOWN_PREVIEW.into()],
+                    work_done_progress_options: Default::default(),
+                }),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
@@ -347,19 +534,32 @@ impl LanguageServer for Backend {
     async fn did_open(&self, p: DidOpenTextDocumentParams) {
         let uri = p.text_document.uri;
         self.state.write().await.docs.insert(uri.clone(), p.text_document.text);
+        if let Ok(path) = uri.to_file_path() {
+            self.follow_markdown(&canonical(&path)).await;
+        }
         self.publish(&uri).await;
     }
 
     async fn did_change(&self, p: DidChangeTextDocumentParams) {
         let uri = p.text_document.uri;
         if let Some(change) = p.content_changes.into_iter().last() {
+            if let Ok(path) = uri.to_file_path() {
+                self.to_preview(preview::Msg::Update(canonical(&path), Some(change.text.clone())));
+            }
             self.state.write().await.docs.insert(uri.clone(), change.text);
         }
+        if let Ok(path) = uri.to_file_path() {
+            self.follow_markdown(&canonical(&path)).await;
+        }
+        self.schedule_markdown_refresh();
         self.publish(&uri).await;
     }
 
     async fn did_save(&self, p: DidSaveTextDocumentParams) {
         let uri = &p.text_document.uri;
+        if let Ok(path) = uri.to_file_path() {
+            self.to_preview(preview::Msg::Update(canonical(&path), None)); // disk is current again
+        }
         let aliases_changed = {
             let state = self.state.read().await;
             match (state.docs.get(uri), uri.to_file_path()) {
@@ -381,6 +581,9 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, p: DidCloseTextDocumentParams) {
+        if let Ok(path) = p.text_document.uri.to_file_path() {
+            self.to_preview(preview::Msg::Update(canonical(&path), None)); // drop unsaved edits
+        }
         self.state.write().await.docs.remove(&p.text_document.uri);
         self.client.publish_diagnostics(p.text_document.uri, vec![], None).await;
     }
@@ -516,6 +719,61 @@ impl LanguageServer for Backend {
         }))
     }
 
+    async fn document_highlight(&self, p: DocumentHighlightParams) -> Result<Option<Vec<DocumentHighlight>>> {
+        let pos = p.text_document_position_params;
+        if let Ok(path) = pos.text_document.uri.to_file_path() {
+            let path = canonical(&path);
+            self.to_preview(preview::Msg::Cursor(path.clone(), pos.position.line + 1));
+            self.follow_markdown(&path).await;
+        }
+        Ok(None)
+    }
+
+    async fn code_action(&self, p: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let Ok(path) = p.text_document.uri.to_file_path() else { return Ok(None) };
+        if self.state.read().await.catalog.locate(&canonical(&path)).is_none() {
+            return Ok(None);
+        }
+        let args = vec![serde_json::Value::String(p.text_document.uri.to_string())];
+        let action = |title: &str, command: &str| {
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.into(),
+                kind: Some(CodeActionKind::EMPTY),
+                command: Some(Command { title: title.into(), command: command.into(), arguments: Some(args.clone()) }),
+                ..Default::default()
+            })
+        };
+        Ok(Some(vec![
+            action("Antora: Open live site preview", CMD_SITE_PREVIEW),
+            action("Antora: Open Markdown preview", CMD_MARKDOWN_PREVIEW),
+        ]))
+    }
+
+    async fn execute_command(&self, p: ExecuteCommandParams) -> Result<Option<serde_json::Value>> {
+        let file = p
+            .arguments
+            .first()
+            .and_then(|a| a.as_str())
+            .and_then(|u| Url::parse(u).ok())
+            .and_then(|u| u.to_file_path().ok())
+            .map(|p| canonical(&p))
+            .ok_or_else(|| invalid("Expected a document URI argument"))?;
+        match p.command.as_str() {
+            CMD_SITE_PREVIEW => {
+                if let Err(msg) = self.open_site_preview(file).await {
+                    self.client.show_message(MessageType::ERROR, format!("Antora preview: {msg}")).await;
+                }
+            }
+            CMD_MARKDOWN_PREVIEW => {
+                if let Err(msg) = self.open_markdown_preview(file).await {
+                    self.client.show_message(MessageType::ERROR, format!("Antora Markdown preview: {msg}")).await;
+                }
+            }
+            other => return Err(invalid(format!("Unknown command {other}"))),
+        }
+        Ok(None)
+    }
+
     async fn references(&self, p: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = p.text_document_position.text_document.uri;
         let Some(resource) = self.subject(&uri, p.text_document_position.position).await else {
@@ -639,6 +897,10 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         state: Arc::new(RwLock::new(State::default())),
+        preview: Default::default(),
+        preview_starting: Default::default(),
+        markdown: Default::default(),
+        markdown_generation: Default::default(),
     });
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket).serve(service).await;
 }

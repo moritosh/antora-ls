@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::catalog::*;
-use crate::{nav, refs, scan};
+use crate::{markdown, nav, refs, scan};
 
 fn write(root: &Path, rel: &str, content: &str) {
     let p = root.join(rel);
@@ -258,4 +258,106 @@ fn path_helpers() {
     assert_eq!(refs::normalize_new_name("./x/y", Family::Page).unwrap(), "x/y.adoc");
     assert_eq!(refs::normalize_new_name("logo.svg", Family::Image).unwrap(), "logo.svg");
     assert!(refs::normalize_new_name("../escape.adoc", Family::Page).is_err());
+}
+
+#[test]
+fn converts_asciidoc_to_markdown() {
+    let dir = fixture();
+    write(dir.path(), "docs/modules/ROOT/partials/steps.adoc", "intro\n// tag::steps[]\n= Steps\n\nDo *this*.\n// end::steps[]\noutro\n");
+    let page = dir.path().join("docs/modules/ROOT/pages/demo.adoc");
+    let text = r#"= Demo Page
+:description: ignored
+:flavor: vanilla
+
+Hello {product}, *bold* _it_ `+{raw}+` and **x**y in {flavor}.
+See xref:install/linux.adoc[] and xref:admin:users.adoc[the users] and xref:nope.adoc[gone].
+
+ifdef::flavor[]
+Flavor is set.
+endif::[]
+ifndef::flavor[]
+Hidden.
+endif::[]
+
+include::partial$steps.adoc[tag=steps,leveloffset=+1]
+
+.Setup
+* one
+** nested
+* [x] done
+
+term:: definition
+
+[NOTE]
+====
+Careful.
+====
+
+TIP: Short tip.
+
+[source,sh]
+----
+echo {flavor}
+----
+
+[cols="1,2",options="header"]
+|===
+|A |B
+|1 |two
+2+|span
+|===
+
+image::logo.png[Logo]
+"#;
+    let cat = Catalog::scan(&[dir.path().to_path_buf()]);
+    let md = markdown::render(&cat, &page, text, &read, None);
+    let relative = markdown::render(&cat, &page, "image::logo.png[]", &read, Some(&canonical_lenient(&dir.path().join("docs/out"))));
+    assert_eq!(relative, "![logo](<../modules/ROOT/images/logo.png>)\n");
+    let anchored = markdown::render(&cat, &page, "xref:install/linux.adoc#apt[APT]", &read, None);
+    assert!(anchored.ends_with("linux.adoc#L9>)\n"), "{anchored}");
+    let linux = canonical(&dir.path().join("docs/modules/ROOT/pages/install/linux.adoc"));
+    let users = canonical(&dir.path().join("docs/modules/admin/pages/users.adoc"));
+    let logo = canonical(&dir.path().join("docs/modules/ROOT/images/logo.png"));
+    let expected = format!(
+        r#"# Demo Page
+
+Hello Widget, **bold** *it* `{{raw}}` and **x**y in vanilla.
+See [Linux](<{linux}>) and [the users](<{users}>) and gone ⚠️.
+
+Flavor is set.
+
+## Steps
+
+Do **this**.
+
+**Setup**
+
+- one
+  - nested
+- [x] done
+
+- **term** — definition
+
+> **Note:**
+>
+> Careful.
+
+> **Tip:** Short tip.
+
+```sh
+echo {{flavor}}
+```
+
+| A | B |
+| --- | --- |
+| 1 | two |
+| span |  |
+
+![Logo](<{logo}>)
+"#,
+        linux = linux.display(),
+        users = users.display(),
+        logo = logo.display()
+    );
+    assert_eq!(md, expected, "\n--- got ---\n{md}");
 }

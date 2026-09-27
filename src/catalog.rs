@@ -401,7 +401,7 @@ impl Catalog {
     }
 
     pub fn locate(&self, file: &Path) -> Option<FileContext> {
-        let file = canonical(file);
+        let file = canonical_lenient(file); // the file may not be saved yet
         let mut best: Option<(usize, FileContext)> = None;
         for (i, cv) in self.components.iter().enumerate() {
             let Ok(rest) = file.strip_prefix(cv.root.join("modules")) else { continue };

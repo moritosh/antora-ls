@@ -172,6 +172,27 @@ fn auto_id(title: &str) -> String {
     s.trim_end_matches('_').to_string()
 }
 
+/// Entries of `:page-aliases:` in the document header (comma-separated, `\` continues a line).
+pub fn page_aliases(text: &str) -> Vec<String> {
+    let mut lines = lines(text).skip_while(|l| l.trim().is_empty());
+    while let Some(line) = lines.next() {
+        if line.trim().is_empty() {
+            break; // end of header
+        }
+        let Some(value) = line.strip_prefix(":page-aliases:") else { continue };
+        let mut value = value.trim().to_string();
+        while let Some(head) = value.strip_suffix('\\') {
+            value = head.trim_end().to_string();
+            match lines.next() {
+                Some(next) => value.push_str(&format!(" {}", next.trim())),
+                None => break,
+            }
+        }
+        return value.split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
+    }
+    Vec::new()
+}
+
 pub fn document_title(text: &str) -> Option<String> {
     lines(text).find_map(|l| l.strip_prefix("= ").map(|t| t.trim().to_string()))
 }

@@ -76,7 +76,7 @@ cargo test
 
 ## Release
 
-Push a tag like `v0.2.0`. The `release` workflow builds `antora-ls-<arch>-<target>.tar.gz|zip` assets for macOS, Linux and Windows, which the Zed extension downloads. The extension downloads without authentication, so this only works once the repository is public.
+Push a tag like `v0.2.1`. The `release` workflow builds `antora-ls-<arch>-<target>.tar.gz|zip` assets for macOS, Linux and Windows, which the Zed extension downloads. The extension downloads without authentication, so this only works once the repository is public.
 
 ## Limitations
 

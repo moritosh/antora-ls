@@ -350,21 +350,47 @@ const TYPES = {
 
 const CLIENT = `(() => {
   const page = decodeURIComponent(location.pathname.slice(1)) || 'index.html'
-  const es = new EventSource('/__preview/events?page=' + encodeURIComponent(page))
+  let es
+  function connect () {
+    es = new EventSource('/__preview/events?page=' + encodeURIComponent(page))
+    es.addEventListener('page', (e) => {
+      const { html, nav } = JSON.parse(e.data)
+      update(html, nav)
+    })
+    es.addEventListener('reload', () => location.reload())
+    es.addEventListener('status', onStatus)
+    es.addEventListener('cursor', onCursor)
+    es.addEventListener('error', () => setTimeout(check, 1000))
+  }
+  // A dropped stream doesn't mean the server is gone (navigation, sleep, bfcache): ask it.
+  async function check () {
+    if (es.readyState === EventSource.OPEN) return
+    try {
+      await fetch('/__preview/ping', { cache: 'no-store' })
+      if (es.readyState === EventSource.CLOSED) connect()
+    } catch {
+      show('The preview server stopped. Open the preview again from the editor.', true)
+    }
+  }
+  // A page restored from the back/forward cache missed updates while it was away. Safari
+  // reconnects its stream (even a closed one, so don't open another); catch up on the content.
+  addEventListener('pageshow', async (e) => {
+    if (!e.persisted) return
+    if (es.readyState === EventSource.CLOSED) connect()
+    update(await (await fetch(location.href, { cache: 'no-store' })).text(), true)
+  })
   const swap = (selector, next) => {
     const a = document.querySelector(selector), b = next.querySelector(selector)
     if (a && b) a.replaceWith(b)
     return a && b
   }
-  es.addEventListener('page', (e) => {
-    const { html, nav } = JSON.parse(e.data)
+  function update (html, nav) {
     const next = new DOMParser().parseFromString(html, 'text/html')
     if (!swap('article.doc', next)) return location.reload()
     if (nav) swap('.nav-menu', next)
     document.title = next.title
     document.querySelectorAll('article.doc pre.highlight code').forEach((el) => window.hljs?.highlightElement?.(el))
-  })
-  es.addEventListener('reload', () => location.reload())
+  }
   let badge
   const show = (text, failed) => {
     if (!text) return badge?.remove()
@@ -378,19 +404,15 @@ const CLIENT = `(() => {
     badge.style.background = failed ? '#b00020' : '#333'
     badge.textContent = text
   }
-  es.addEventListener('status', (e) => {
+  function onStatus (e) {
     const { state, phase, error } = JSON.parse(e.data)
     show(state === 'ready' ? '' : state === 'failed' ? 'Rebuild failed: ' + error : 'Rebuilding site: ' + (phase || '') + '…', state === 'failed')
-  })
-  // Checked after a moment, since reloading the page also interrupts the stream.
-  es.addEventListener('error', () => setTimeout(() => {
-    if (es.readyState !== EventSource.OPEN) show('The preview server stopped. Open the preview again from the editor.', true)
-  }, 1000))
-  es.addEventListener('cursor', (e) => {
+  }
+  function onCursor (e) {
     const { page: target, line } = JSON.parse(e.data)
     if (target !== page) return (location.href = '/' + target + '#preview-line-' + line)
     scrollToLine(line)
-  })
+  }
   function scrollToLine (line) {
     let best, bestLine = -1
     document.querySelectorAll('[class*="preview-line-"]').forEach((el) => {
@@ -403,6 +425,7 @@ const CLIENT = `(() => {
   }
   const m = location.hash.match(/^#preview-line-(\\d+)$/)
   if (m) addEventListener('load', () => scrollToLine(+m[1]))
+  connect()
 })()`
 
 /** Shown until the first build is done; reloads into the requested page then. */
@@ -440,11 +463,17 @@ const LOADING = `<!doctype html>
     msg.textContent = failed ? 'The site build failed. Save a file to retry.' : 'Building the site: ' + (s.phase || '') + '…'
   })
   es.addEventListener('reload', () => location.reload())
-  es.addEventListener('error', () => setTimeout(() => {
+  es.addEventListener('error', () => setTimeout(async () => {
     if (es.readyState === EventSource.OPEN) return
-    spin.hidden = time.hidden = true
-    msg.textContent = 'The preview server stopped. Open the preview again from the editor.'
+    try {
+      await fetch('/__preview/ping', { cache: 'no-store' })
+      if (es.readyState === EventSource.CLOSED) location.reload()
+    } catch {
+      spin.hidden = time.hidden = true
+      msg.textContent = 'The preview server stopped. Open the preview again from the editor.'
+    }
   }, 1000))
+  addEventListener('pageshow', (e) => e.persisted && location.reload())
   setInterval(() => (time.textContent = Math.round((Date.now() - started) / 1000) + ' s'), 1000)
 </script>
 </body></html>`
@@ -502,6 +531,7 @@ function reply (res, status, type, body) {
 function api (req, res, url) {
   const route = url.pathname.slice('/__preview/'.length)
   if (route === 'client.js') return reply(res, 200, TYPES['.js'], CLIENT)
+  if (route === 'ping') return reply(res, 204, 'text/plain', '')
   if (route === 'events') {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' })
     res.write(': connected\n\n')

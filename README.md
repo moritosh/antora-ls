@@ -76,7 +76,9 @@ cargo test
 
 ## Release
 
-Push a tag like `v0.2.1`. The `release` workflow builds `antora-ls-<arch>-<target>.tar.gz|zip` assets for macOS, Linux and Windows, which the Zed extension downloads. The extension downloads without authentication, so this only works once the repository is public.
+Bump `version` in `Cargo.toml` (and `Cargo.lock`), commit, and push a tag like `v0.2.2`. The `release` workflow builds `antora-ls-<arch>-<target>.tar.gz|zip` assets for macOS, Linux and Windows, which the Zed extension downloads. The extension downloads without authentication, so this only works once the repository is public.
+
+Releases are versioned independently of the projects below; see [Used by](#used-by) for how a release reaches them.
 
 ## Limitations
 
@@ -85,6 +87,11 @@ Push a tag like `v0.2.1`. The `release` workflow builds `antora-ls-<arch>-<targe
 - Undoing a rename in the editor reverts the text edits but not the file move; rename again to reverse it.
 - The live preview runs in a browser; editors like Zed have no API for extensions to embed one.
 - Because pages are rendered on demand, a search extension such as Lunr only indexes page titles in the preview, and Antora extensions that post-process converted pages don't run on them.
+
+## Used by
+
+- [antora-zed](https://github.com/moritosh/antora-zed), the Zed extension, runs the language server. It downloads the latest antora-ls release for the platform (unless one is configured or on the `PATH`), so users get a new release without an extension update.
+- [antora-intellij](https://github.com/moritosh/antora-intellij), the IntelliJ plugin, doesn't use the language server: it bundles `preview/antora-preview.js` from the antora-ls release named by `antoraLsVersion` in its `gradle.properties`. Changes to the preview server reach it when that version is raised and the plugin is released.
 
 ## License and attribution
 

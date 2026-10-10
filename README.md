@@ -1,6 +1,6 @@
 # antora-ls
 
-A language server for [Antora](https://antora.org) documentation sites. It understands Antora's content model — components, versions, modules, resource families and resource IDs — and speaks plain LSP over stdio. It's built for the [zed-antora](https://github.com/moritosh/zed-antora) extension but works with any LSP client.
+A language server for [Antora](https://antora.org) documentation sites. It understands Antora's content model — components, versions, modules, resource families and resource IDs — and speaks plain LSP over stdio. It's built for the [antora-zed](https://github.com/moritosh/antora-zed) extension but works with any LSP client.
 
 ## Features
 

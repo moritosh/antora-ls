@@ -64,8 +64,64 @@ Initialization options (in Zed: `lsp.antora-ls.initialization_options`):
 
 ## Install
 
+**In Zed you don't need these steps:** the [antora-zed](https://github.com/moritosh/antora-zed) extension downloads antora-ls by itself. For other editors, install the binary from the [latest release](https://github.com/moritosh/antora-ls/releases/latest) as below, then set up `antora-ls` as the language server for AsciiDoc files. It takes no arguments and talks LSP over stdin and stdout.
+
+### macOS
+
+1. Download the binary into `~/.local/bin`. On Apple Silicon:
+   ```sh
+   mkdir -p ~/.local/bin
+   curl -fsSL https://github.com/moritosh/antora-ls/releases/latest/download/antora-ls-aarch64-apple-darwin.tar.gz | tar xz -C ~/.local/bin
+   ```
+   On an Intel Mac, use `antora-ls-x86_64-apple-darwin.tar.gz` instead. If you download the archive in a browser rather than with `curl`, macOS blocks the unsigned binary; run `xattr -d com.apple.quarantine ~/.local/bin/antora-ls` once to allow it.
+2. If `~/.local/bin` isn't on your `PATH` yet, add it and open a new terminal:
+   ```sh
+   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zprofile
+   ```
+3. Check that it runs: `antora-ls --version`.
+4. For the live preview, install [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`) or Node (`brew install node`, or the installer from [nodejs.org](https://nodejs.org)).
+
+### Windows
+
+1. In PowerShell, download the binary and add its folder to your user `PATH`:
+   ```powershell
+   $dir = "$env:LOCALAPPDATA\Programs\antora-ls"
+   Invoke-WebRequest https://github.com/moritosh/antora-ls/releases/latest/download/antora-ls-x86_64-pc-windows-msvc.zip -OutFile "$env:TEMP\antora-ls.zip"
+   Expand-Archive "$env:TEMP\antora-ls.zip" -DestinationPath $dir -Force
+   [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$dir", "User")
+   ```
+   There's no ARM build; on Windows on ARM, this x64 build runs under emulation.
+2. Open a new terminal and check that it runs: `antora-ls --version`. Restart your editor too, so it sees the new `PATH`.
+3. For the live preview, install [Bun](https://bun.sh) (`powershell -c "irm bun.sh/install.ps1 | iex"`) or Node (`winget install OpenJS.NodeJS.LTS`, or the installer from [nodejs.org](https://nodejs.org)).
+
+### Linux
+
+1. Download the binary into `~/.local/bin`; this picks the x86_64 or ARM64 build:
+   ```sh
+   mkdir -p ~/.local/bin
+   curl -fsSL https://github.com/moritosh/antora-ls/releases/latest/download/antora-ls-$(uname -m)-unknown-linux-gnu.tar.gz | tar xz -C ~/.local/bin
+   ```
+   The binaries need glibc 2.39 or later (Ubuntu 24.04, Debian 13, Fedora 40 or newer). On older distributions, [build from source](#from-source).
+2. If `~/.local/bin` isn't on your `PATH`, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.profile` and log in again.
+3. Check that it runs: `antora-ls --version`.
+4. For the live preview, install [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`; it needs `unzip`) or Node (your distribution's `nodejs` package, or [nvm](https://github.com/nvm-sh/nvm)).
+
+### From source
+
+With Rust installed from [rustup.rs](https://rustup.rs), on any of the three:
+
 ```sh
-cargo install --path .
+cargo install --git https://github.com/moritosh/antora-ls
+```
+
+In a clone, `cargo install --path .` does the same.
+
+### The docs project
+
+Completion, navigation and diagnostics work on any folder with `antora.yml` files. The live preview also needs Antora 3 installed in the project that contains the playbook:
+
+```sh
+npm i -D antora    # or: pnpm add -D antora, yarn add -D antora, bun add -d antora
 ```
 
 ## Test

@@ -11,7 +11,9 @@
 // Usage: bun antora-preview.js <playbook> [--port N]
 // Prints `ANTORA_PREVIEW <url> <token>` on stdout as soon as the server listens (browsers get a
 // progress page until the first build is done), then `ANTORA_PREVIEW_STATUS <json>` lines as
-// builds progress; logs go to stderr. Only Node built-ins are used, so it runs under Bun or Node.
+// builds progress, and `ANTORA_PREVIEW_REVEAL <json>` when a block is double-clicked in the browser
+// (the editor shows its source line); logs go to stderr. Only Node built-ins are used, so it runs
+// under Bun or Node.
 
 const fs = require('node:fs')
 const http = require('node:http')
@@ -423,6 +425,12 @@ const CLIENT = `(() => {
     const r = best.getBoundingClientRect()
     if (r.top < 80 || r.bottom > innerHeight) best.scrollIntoView({ block: 'center', behavior: 'smooth' })
   }
+  // Double-click a block to show its source line in the editor.
+  addEventListener('dblclick', (e) => {
+    const el = e.target.closest?.('[class*="preview-line-"]')
+    const line = el && +(el.className.match(/preview-line-(\\d+)/) || [])[1]
+    if (line) fetch('/__preview/reveal', { method: 'POST', body: JSON.stringify({ page, line }) })
+  })
   const m = location.hash.match(/^#preview-line-(\\d+)$/)
   if (m) addEventListener('load', () => scrollToLine(+m[1]))
   connect()
@@ -496,10 +504,8 @@ async function serve (req, res) {
   if (!S.site) return reply(res, 200, TYPES['.html'], LOADING)
   if (url.pathname === '/__preview/open') return open(res, url)
 
-  let key = decodeURIComponent(url.pathname).replace(/^\/+/, '')
-  if (key === '' || key.endsWith('/')) key += 'index.html'
   const site = S.site
-  const file = site.routes.get(key) || site.routes.get(key + '.html') || site.routes.get(key + '/index.html')
+  const file = findRoute(decodeURIComponent(url.pathname))
   if (!file) {
     const notFound = site.routes.get('404.html')
     return reply(res, 404, TYPES['.html'], notFound ? inject(notFound.contents.toString()) : 'not found')
@@ -508,6 +514,14 @@ async function serve (req, res) {
   const type = TYPES[path.extname(file.out.path).toLowerCase()] || 'application/octet-stream'
   const contents = await contentsOf(file)
   reply(res, 200, type, type.startsWith('text/html') ? inject(contents.toString()) : contents)
+}
+
+/** The site file served at a URL path. */
+function findRoute (pathname) {
+  let key = pathname.replace(/^\/+/, '')
+  if (key === '' || key.endsWith('/')) key += 'index.html'
+  const routes = S.site.routes
+  return routes.get(key) || routes.get(key + '.html') || routes.get(key + '/index.html')
 }
 
 /** A file's contents as a Buffer. Some, like assets that extensions add to the UI, are a
@@ -542,6 +556,7 @@ function api (req, res, url) {
     return
   }
   if (req.method !== 'POST') return reply(res, 404, 'text/plain', 'not found')
+  if (route === 'reveal') return reveal(req, res)
   if (req.headers['x-preview-token'] !== S.token) return reply(res, 403, 'text/plain', 'forbidden')
   let body = ''
   req.on('data', (chunk) => (body += chunk))
@@ -555,6 +570,26 @@ function api (req, res, url) {
     } catch (err) {
       log('request failed: ' + (err.stack || err))
       reply(res, 500, 'text/plain', String(err))
+    }
+  })
+}
+
+/** Tell the editor to show the source line of a block double-clicked in a preview page. Browsers
+ * send these, so they can't carry the token; only the preview's own pages may. */
+function reveal (req, res) {
+  const sameOrigin = req.headers.origin ? req.headers.origin === S.base : req.headers['sec-fetch-site'] === 'same-origin'
+  if (!sameOrigin) return reply(res, 403, 'text/plain', 'forbidden')
+  let body = ''
+  req.on('data', (chunk) => (body += chunk))
+  req.on('end', () => {
+    try {
+      const { page, line } = JSON.parse(body || '{}')
+      const file = S.site && typeof page === 'string' && findRoute(page)
+      if (!file || !isPage(file) || !file.src.abspath || !Number.isInteger(line)) return reply(res, 404, 'text/plain', 'not found')
+      process.stdout.write(`ANTORA_PREVIEW_REVEAL ${JSON.stringify({ path: realpath(file.src.abspath), line })}\n`)
+      reply(res, 204, 'text/plain', '')
+    } catch (err) {
+      reply(res, 400, 'text/plain', String(err))
     }
   })
 }
@@ -597,7 +632,8 @@ async function main () {
   process.on('unhandledRejection', (err) => log('internal error: ' + (err?.stack || err)))
   const server = http.createServer(handle)
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve))
-  process.stdout.write(`ANTORA_PREVIEW http://127.0.0.1:${server.address().port} ${S.token}\n`)
+  S.base = `http://127.0.0.1:${server.address().port}`
+  process.stdout.write(`ANTORA_PREVIEW ${S.base} ${S.token}\n`)
   runBuild()
   // Keep SSE connections alive through proxies and sleeping laptops.
   setInterval(() => S.clients.forEach((c) => c.res.write(': ping\n\n')), 15000).unref()

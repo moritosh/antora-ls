@@ -46,7 +46,7 @@ Both are offered as code actions on any file in the site.
 - **Follows the cursor**: the browser scrolls to the block you're editing, and switches to another page when you start editing it.
 - **In memory**: the site is served from memory on `127.0.0.1` and nothing is written to the project. Updates are only accepted from the language server (they carry a per-session token).
 
-Requirements: an Antora playbook in the workspace with Antora 3 installed in the project (`node_modules`, including pnpm layouts), and [Bun](https://bun.sh) or Node. The runtime is found as `bun` on the PATH, then `~/.bun/bin/bun`, then `node`. The preview server is `preview/antora-preview.js`, embedded in the binary; it uses only built-in modules and the project's Antora. It stops when the language server exits.
+Requirements: an Antora playbook in the workspace with Antora 3 installed in the project (`node_modules`, including pnpm layouts), and [Bun](https://bun.sh) or Node. The runtime is found as `bun` on the PATH, then `~/.bun/bin/bun`, then `node` (on Windows: `bun.exe`, `%USERPROFILE%\.bun\bin\bun.exe`, `node.exe`). The preview server is `preview/antora-preview.js`, embedded in the binary; it uses only built-in modules and the project's Antora. It stops when the language server exits.
 
 ### Markdown preview
 

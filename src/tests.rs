@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::catalog::*;
-use crate::{markdown, nav, refs, scan};
+use crate::{markdown, nav, preview, refs, scan};
 
 fn write(root: &Path, rel: &str, content: &str) {
     let p = root.join(rel);
@@ -360,4 +360,20 @@ echo {{flavor}}
         logo = logo.display()
     );
     assert_eq!(md, expected, "\n--- got ---\n{md}");
+}
+
+#[test]
+fn finds_the_preview_runtime_on_unix_and_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    write(r, "bin/node", "");
+    write(r, "win/node.exe", "");
+    write(r, "home/.bun/bin/bun.exe", "");
+    let path = |d: &str| Some(std::env::join_paths([r.join(d)]).unwrap());
+
+    assert_eq!(preview::runtime_in(path("bin"), None, ""), Some(r.join("bin/node")));
+    // Windows names them node.exe and bun.exe; Bun's install directory comes before Node.
+    assert_eq!(preview::runtime_in(path("win"), None, ".exe"), Some(r.join("win/node.exe")));
+    assert_eq!(preview::runtime_in(path("win"), Some(r.join("home")), ".exe"), Some(r.join("home/.bun/bin/bun.exe")));
+    assert_eq!(preview::runtime_in(path("win"), None, ""), None);
 }

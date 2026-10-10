@@ -2,6 +2,7 @@
 //! or Node) and forwards unsaved edits and cursor moves to it.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
@@ -217,14 +218,22 @@ pub fn find_runtime(configured: Option<&str>) -> Option<PathBuf> {
     if let Some(c) = configured {
         return Some(PathBuf::from(c));
     }
+    // Windows usually has no HOME; Bun installs to %USERPROFILE%\.bun there.
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    runtime_in(std::env::var_os("PATH"), home.map(PathBuf::from), std::env::consts::EXE_SUFFIX)
+}
+
+/// [`find_runtime`] without a setting, given the PATH, the home directory and the suffix of
+/// executables (`.exe` on Windows).
+pub(crate) fn runtime_in(path: Option<OsString>, home: Option<PathBuf>, exe_suffix: &str) -> Option<PathBuf> {
+    let exe = |name: &str| format!("{name}{exe_suffix}");
     let on_path = |name: &str| {
-        std::env::var_os("PATH")
-            .into_iter()
-            .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-            .map(|d| d.join(name))
+        path.iter()
+            .flat_map(|p| std::env::split_paths(p).collect::<Vec<_>>())
+            .map(|d| d.join(exe(name)))
             .find(|p| p.is_file())
     };
-    let home_bun = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".bun/bin/bun")).filter(|p| p.is_file());
+    let home_bun = home.map(|h| h.join(".bun").join("bin").join(exe("bun"))).filter(|p| p.is_file());
     on_path("bun").or(home_bun).or_else(|| on_path("node"))
 }
 

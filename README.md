@@ -76,7 +76,7 @@ cargo test
 
 ## Release
 
-Bump `version` in `Cargo.toml` (and `Cargo.lock`), commit, and push a tag like `v0.2.2`. The `release` workflow builds `antora-ls-<arch>-<target>.tar.gz|zip` assets for macOS, Linux and Windows, which the Zed extension downloads.
+Bump `version` in `Cargo.toml` (and `Cargo.lock`), commit, and push a tag like `v0.2.3`. The `release` workflow builds `antora-ls-<arch>-<target>.tar.gz|zip` assets for macOS, Linux and Windows, which the Zed extension downloads.
 
 Releases are versioned independently of the projects below; see [Used by](#used-by) for how a release reaches them.
 
